@@ -65,13 +65,21 @@ RETURN = """
 
 
 class Bitwarden(object):
-
     def __init__(self, path):
         self._cli_path = path
+        self._bw_session = ""
         try:
-            check_output(self._cli_path)
+            check_output([self._cli_path, "--version"])
         except OSError:
             raise AnsibleError("Command not found: {0}".format(self._cli_path))
+
+    @property
+    def session(self):
+        return self._bw_session
+
+    @session.setter
+    def session(self, value):
+        self._bw_session = value
 
     @property
     def cli_path(self):
@@ -79,10 +87,18 @@ class Bitwarden(object):
 
     @property
     def logged_in(self):
-        return 'BW_SESSION' in os.environ
+        # Parse Bitwarden status to check if logged in
+        if self.status() == 'unlocked':
+            return True
+        else:
+            return False
 
     def _run(self, args):
-        p = Popen([self.cli_path] + args, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
+        my_env = os.environ.copy()
+        if self.session != "":
+            my_env["BW_SESSION"] = self.session
+        p = Popen([self.cli_path] + args, stdin=PIPE,
+                  stdout=PIPE, stderr=STDOUT, env=my_env)
         out, _ = p.communicate()
         out = out.decode()
         rc = p.wait()
@@ -100,7 +116,7 @@ class Bitwarden(object):
                                    "Make sure BW_SESSION is set properly.")
             elif out.startswith("Not found."):
                 raise AnsibleError("Error accessing Bitwarden vault. "
-                        "Specified item not found: {}".format(args[-1]))
+                                   "Specified item not found: {}".format(args[-1]))
             else:
                 raise AnsibleError("Unknown failure in 'bw' command: "
                                    "{0}".format(out))
@@ -108,6 +124,13 @@ class Bitwarden(object):
 
     def sync(self):
         self._run(['sync'])
+
+    def status(self):
+        try:
+            data = json.loads(self._run(['status']))
+        except json.decoder.JSONDecodeError as e:
+            raise AnsibleError("Error decoding Bitwarden status: %s" % e)
+        return data['status']
 
     def get_entry(self, key, field):
         return self._run(["get", field, key])
@@ -119,6 +142,11 @@ class Bitwarden(object):
     def get_custom_field(self, key, field):
         data = json.loads(self.get_entry(key, 'item'))
         return next(x for x in data['fields'] if x['name'] == field)['value']
+
+    def get_attachments(self, key, itemid, output):
+        attachment = ['get', 'attachment', '{}'.format(
+            key), '--output={}'.format(output), '--itemid={}'.format(itemid)]
+        return self._run(attachment)
 
 
 class LookupModule(LookupBase):
@@ -136,12 +164,23 @@ class LookupModule(LookupBase):
 
         if kwargs.get('sync'):
             bw.sync()
+        if kwargs.get('session'):
+            bw.session = kwargs.get('session')
 
         for term in terms:
             if kwargs.get('custom_field'):
                 values.append(bw.get_custom_field(term, field))
             elif field == 'notes':
                 values.append(bw.get_notes(term))
+            elif kwargs.get('attachments'):
+                if kwargs.get('itemid'):
+                    itemid = kwargs.get('itemid')
+                    output = kwargs.get('output', term)
+                    values.append(bw.get_attachments(term, itemid, output))
+                else:
+                    raise AnsibleError("Missing value for - itemid - "
+                                       "Please set parameters as example: - "
+                                       "itemid='f12345-d343-4bd0-abbf-4532222' ")
             else:
                 values.append(bw.get_entry(term, field))
         return values
